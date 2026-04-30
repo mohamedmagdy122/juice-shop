@@ -1,0 +1,137 @@
+name: Terraform DevSecOps Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        working-directory: Terraform-IAC
+        run: terraform init
+      - name: Terraform Validate
+        working-directory: Terraform-IAC
+        run: terraform validate
+      - name: Terraform Plan
+        working-directory: Terraform-IAC
+        run: terraform plan -out=tfplan
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: Terraform-IAC/tfplan
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: plan
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: Terraform-IAC
+          format: json
+          additional_args: --out tfsec-report.json
+        continue-on-error: true
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: Terraform-IAC
+          output_format: json
+          output_file_path: checkov-report.json
+          soft_fail: true
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-reports
+          path: |
+            tfsec-report.json
+            checkov-report.json
+
+  publish-to-defectdojo:
+    name: Publish to DefectDojo
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - name: Download scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: scan-reports
+      - name: Upload tfsec report to DefectDojo
+        continue-on-error: true
+        run: |
+          curl -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_TOKEN }}" \
+            -F "scan_type=TFSec Scan" \
+            -F "file=@tfsec-report.json" \
+            -F "engagement_name=juice-shop-${{ github.ref_name }}" \
+            -F "product_name=Juice Shop DevSecOps" \
+            -F "auto_create_context=true"
+      - name: Upload Checkov report to DefectDojo
+        continue-on-error: true
+        run: |
+          curl -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_TOKEN }}" \
+            -F "scan_type=Checkov Scan" \
+            -F "file=@checkov-report.json" \
+            -F "engagement_name=juice-shop-${{ github.ref_name }}" \
+            -F "product_name=Juice Shop DevSecOps" \
+            -F "auto_create_context=true"
+
+  execute:
+    name: Terraform Apply/Destroy
+    runs-on: ubuntu-latest
+    needs: publish-to-defectdojo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        working-directory: Terraform-IAC
+        run: terraform init
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: Terraform-IAC
+      - name: Terraform Apply
+        if: ${{ github.event.inputs.action == 'apply' }}
+        working-directory: Terraform-IAC
+        run: terraform apply -auto-approve tfplan
+      - name: Terraform Destroy
+        if: ${{ github.event.inputs.action == 'destroy' }}
+        working-directory: Terraform-IAC
+        run: terraform destroy -auto-approve
+      - name: Print outputs
+        if: ${{ github.event.inputs.action == 'apply' }}
+        working-directory: Terraform-IAC
+        run: terraform output
