@@ -225,7 +225,7 @@ jobs:
           -F "product_name=Juice Shop DevSecOps" \
           -F "auto_create_context=true"
 
-deploy:
+  deploy:
     name: Deploy via SSM
     runs-on: ubuntu-latest
     needs: publish-to-defectdojo
