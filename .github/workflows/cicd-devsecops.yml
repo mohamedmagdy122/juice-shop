@@ -225,7 +225,7 @@ jobs:
           -F "product_name=Juice Shop DevSecOps" \
           -F "auto_create_context=true"
 
-  deploy:
+deploy:
     name: Deploy via SSM
     runs-on: ubuntu-latest
     needs: publish-to-defectdojo
@@ -240,11 +240,5 @@ jobs:
         aws ssm send-command \
           --instance-ids "i-0a4323478159adea8" \
           --document-name "AWS-RunShellScript" \
-          --parameters commands=[
-            "docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}",
-            "docker pull ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}",
-            "docker stop juice-shop || true",
-            "docker rm juice-shop || true",
-            "docker run -d --name juice-shop -p 3000:3000 ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}"
-          ] \
+          --parameters '{"commands":["docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}","docker pull ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}","docker stop juice-shop || true","docker rm juice-shop || true","docker run -d --name juice-shop -p 3000:3000 ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}"]}' \
           --region us-east-1
