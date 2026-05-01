@@ -1,0 +1,250 @@
+name: CI/CD DevSecOps Pipeline
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  gitleaks:
+    name: Gitleaks Secret Scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Run Gitleaks
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      continue-on-error: true
+    - name: Generate Gitleaks report
+      if: always()
+      run: |
+        docker run --rm -v $(pwd):/repo zricethezav/gitleaks:latest detect \
+          --source /repo --report-format json \
+          --report-path /repo/gitleaks-report.json || true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: gitleaks-report
+        path: gitleaks-report.json
+
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run Semgrep
+      run: |
+        pip install semgrep
+        semgrep --config=auto --json --output=semgrep-report.json . || true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: semgrep-report
+        path: semgrep-report.json
+
+  retirejs:
+    name: Retire.js SCA
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Run Retire.js
+      run: |
+        npm install -g retire
+        retire --path . --outputformat json --outputpath retirejs-report.json || true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: retirejs-report
+        path: retirejs-report.json
+
+  trivy-config:
+    name: Trivy Config Scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run Trivy config scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: config
+        scan-ref: .
+        format: json
+        output: trivy-config-report.json
+      continue-on-error: true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trivy-config-report
+        path: trivy-config-report.json
+
+  build-push:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    needs: [gitleaks, semgrep, retirejs, trivy-config]
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and Push
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository_owner }}/juice-shop:latest
+          ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}
+
+  trivy-image:
+    name: Trivy Image Scan
+    runs-on: ubuntu-latest
+    needs: build-push
+    continue-on-error: true
+    steps:
+    - name: Run Trivy image scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}
+        format: json
+        output: trivy-image-report.json
+      continue-on-error: true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: trivy-image-report
+        path: trivy-image-report.json
+
+  zap:
+    name: OWASP ZAP DAST
+    runs-on: ubuntu-latest
+    needs: build-push
+    continue-on-error: true
+    steps:
+    - name: Run Juice Shop container
+      run: |
+        docker run -d -p 3000:3000 \
+          ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}
+        sleep 30
+    - name: ZAP Baseline Scan
+      uses: zaproxy/action-baseline@v0.12.0
+      with:
+        target: http://localhost:3000
+        rules_file_name: .zap/rules.tsv
+        cmd_options: '-J zap-report.json'
+      continue-on-error: true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: zap-report
+        path: zap-report.json
+
+  publish-to-defectdojo:
+    name: Publish to DefectDojo
+    runs-on: ubuntu-latest
+    needs: [gitleaks, semgrep, retirejs, trivy-config, trivy-image, zap]
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+    - name: Upload Gitleaks report
+      continue-on-error: true
+      run: |
+        curl -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_TOKEN }}" \
+          -F "scan_type=Gitleaks Scan" \
+          -F "file=@gitleaks-report/gitleaks-report.json" \
+          -F "engagement_name=juice-shop-${{ github.ref_name }}" \
+          -F "product_name=Juice Shop DevSecOps" \
+          -F "auto_create_context=true"
+    - name: Upload Semgrep report
+      continue-on-error: true
+      run: |
+        curl -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_TOKEN }}" \
+          -F "scan_type=Semgrep JSON Report" \
+          -F "file=@semgrep-report/semgrep-report.json" \
+          -F "engagement_name=juice-shop-${{ github.ref_name }}" \
+          -F "product_name=Juice Shop DevSecOps" \
+          -F "auto_create_context=true"
+    - name: Upload Retire.js report
+      continue-on-error: true
+      run: |
+        curl -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_TOKEN }}" \
+          -F "scan_type=Retire.js Scan" \
+          -F "file=@retirejs-report/retirejs-report.json" \
+          -F "engagement_name=juice-shop-${{ github.ref_name }}" \
+          -F "product_name=Juice Shop DevSecOps" \
+          -F "auto_create_context=true"
+    - name: Upload Trivy config report
+      continue-on-error: true
+      run: |
+        curl -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_TOKEN }}" \
+          -F "scan_type=Trivy Scan" \
+          -F "file=@trivy-config-report/trivy-config-report.json" \
+          -F "engagement_name=juice-shop-${{ github.ref_name }}" \
+          -F "product_name=Juice Shop DevSecOps" \
+          -F "auto_create_context=true"
+    - name: Upload Trivy image report
+      continue-on-error: true
+      run: |
+        curl -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_TOKEN }}" \
+          -F "scan_type=Trivy Scan" \
+          -F "file=@trivy-image-report/trivy-image-report.json" \
+          -F "engagement_name=juice-shop-${{ github.ref_name }}" \
+          -F "product_name=Juice Shop DevSecOps" \
+          -F "auto_create_context=true"
+    - name: Upload ZAP report
+      continue-on-error: true
+      run: |
+        curl -X POST "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+          -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_TOKEN }}" \
+          -F "scan_type=ZAP Scan" \
+          -F "file=@zap-report/zap-report.json" \
+          -F "engagement_name=juice-shop-${{ github.ref_name }}" \
+          -F "product_name=Juice Shop DevSecOps" \
+          -F "auto_create_context=true"
+
+  deploy:
+    name: Deploy via SSM
+    runs-on: ubuntu-latest
+    needs: publish-to-defectdojo
+    steps:
+    - name: Configure AWS credentials via OIDC
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: us-east-1
+    - name: Deploy via SSM
+      run: |
+        aws ssm send-command \
+          --instance-ids "i-0a4323478159adea8" \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands=[
+            "docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}",
+            "docker pull ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}",
+            "docker stop juice-shop || true",
+            "docker rm juice-shop || true",
+            "docker run -d --name juice-shop -p 3000:3000 ghcr.io/${{ github.repository_owner }}/juice-shop:${{ github.sha }}"
+          ] \
+          --region us-east-1
