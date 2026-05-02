@@ -12,4 +12,4 @@ OIDC-based authentication is safer than storing AWS access keys as GitHub secret
 
 ## Repository Links
 - Juice Shop Fork: https://github.com/mohamedmagdy122/juice-shop
-- ArgoCD GitOps Repo: https://github.com/mohamedmagdy122/argocd-gitops-repo
+
